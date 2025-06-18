@@ -7,14 +7,14 @@ namespace ProcessMonitorService.Core;
 public class ProcessMonitorWorker : BackgroundService
 {
     private readonly ILogger<ProcessMonitorWorker> _logger;
-    private readonly IOptionsMonitor<ProcessMonitorOptions> _optionsMonitor;
     private readonly IProcessOwnerService _processOwnerService;
 
     private HashSet<string> _processFilterSet = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _processExcludeFilterSet = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<int, ProcessCacheEntry> _processSidCache = new();
-    private readonly object _filterUpdateLock = new object();
     private string _lastFilterSnapshot = "";
+
+    private readonly ConcurrentDictionary<int, ProcessCacheEntry> _processSidCache = new();
+    private readonly Lock _filterUpdateLock = new();
 
     private ManagementEventWatcher? _startWatcher;
     private ManagementEventWatcher? _stopWatcher;
@@ -22,7 +22,7 @@ public class ProcessMonitorWorker : BackgroundService
     private Timer? _statusTimer;
 
     private ProcessMonitorOptions _currentOptions;
-    private bool _disposed = false;
+    private bool _disposed;
 
     public ProcessMonitorWorker(
         ILogger<ProcessMonitorWorker> logger,
@@ -30,14 +30,13 @@ public class ProcessMonitorWorker : BackgroundService
         IProcessOwnerService processOwnerService)
     {
         _logger = logger;
-        _optionsMonitor = optionsMonitor;
         _processOwnerService = processOwnerService;
-        _currentOptions = _optionsMonitor.CurrentValue;
+        _currentOptions = optionsMonitor.CurrentValue;
 
         UpdateProcessFilters(_currentOptions.ProcessFilters, _currentOptions.ProcessExcludeFilters);
 
         // Configuration change handler
-        _optionsMonitor.OnChange(options =>
+        optionsMonitor.OnChange(options =>
         {
             _currentOptions = options;
             UpdateProcessFilters(_currentOptions.ProcessFilters, _currentOptions.ProcessExcludeFilters);
@@ -187,8 +186,8 @@ public class ProcessMonitorWorker : BackgroundService
         lock (_filterUpdateLock)
         {
             string snapshot = string.Join(",", filters) + "|" + string.Join(",", excludeFilters);
-            _logger.LogDebug("snapshot            {snapshot}", snapshot);
-            _logger.LogDebug("_lastFilterSnapshot {_lastFilterSnapshot}", _lastFilterSnapshot);
+            _logger.LogDebug("snapshot            {Snapshot}", snapshot);
+            _logger.LogDebug("_lastFilterSnapshot {LastFilterSnapshot}", _lastFilterSnapshot);
             if (snapshot == _lastFilterSnapshot)
             {
                 _logger.LogDebug("Configuration snapshot identical, skipping update. Last snapshot: {LastSnapshot}", _lastFilterSnapshot);
@@ -199,13 +198,13 @@ public class ProcessMonitorWorker : BackgroundService
 
             _lastFilterSnapshot = snapshot;
 
-            _processFilterSet = new HashSet<string>(filters ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
-            _processExcludeFilterSet = new HashSet<string>(excludeFilters ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+            _processFilterSet = new HashSet<string>(filters, StringComparer.OrdinalIgnoreCase);
+            _processExcludeFilterSet = new HashSet<string>(excludeFilters, StringComparer.OrdinalIgnoreCase);
 
             _logger.LogInformation("Process filters updated: {FilterCount} include filters, {ExcludeFilterCount} exclude filters loaded",
                 _processFilterSet.Count, _processExcludeFilterSet.Count);
-            _logger.LogDebug("Active include filters: {@ProcessFilters}", _processFilterSet.ToArray());
-            _logger.LogDebug("Active exclude filters: {@ProcessExcludeFilters}", _processExcludeFilterSet.ToArray());
+            _logger.LogDebug("Active include filters: {ProcessFilters}", [.. _processFilterSet]);
+            _logger.LogDebug("Active exclude filters: {ProcessExcludeFilters}", [.. _processExcludeFilterSet]);
 
             // WMI-Watcher neu initialisieren, wenn sie bereits laufen
             if (_startWatcher != null || _stopWatcher != null)
@@ -234,6 +233,7 @@ public class ProcessMonitorWorker : BackgroundService
             _logger.LogError(ex, "Error restarting WMI watchers");
         }
     }
+
     private void InitializeTimers()
     {
         // Cache cleanup timer
@@ -291,17 +291,16 @@ public class ProcessMonitorWorker : BackgroundService
             uint parentPid = Convert.ToUInt32(process["ParentProcessId"]);
             string parentName = await _processOwnerService.GetProcessNameByIdAsync(parentPid);
 
-            if (eventType == "Start")
+            switch (eventType)
             {
-                sid = await _processOwnerService.GetProcessOwnerSidAsync(pid);
-                _processSidCache[pid] = new ProcessCacheEntry { Sid = sid };
-            }
-            else if (eventType == "Stop")
-            {
-                if (_processSidCache.TryRemove(pid, out var cachedEntry))
-                {
+                case "Start":
+                    sid = await _processOwnerService.GetProcessOwnerSidAsync(pid);
+                    _processSidCache[pid] = new ProcessCacheEntry { Sid = sid };
+                    break;
+
+                case "Stop" when _processSidCache.TryRemove(pid, out var cachedEntry):
                     sid = cachedEntry.Sid;
-                }
+                    break;
             }
 
             // Rufen Sie die aktualisierte Logging-Methode mit den neuen Parametern auf
@@ -479,7 +478,7 @@ public class ProcessMonitorWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Error during disposal");
+                _logger.LogError(ex, "Error during disposal");
             }
             _disposed = true;
         }
