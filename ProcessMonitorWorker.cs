@@ -10,6 +10,8 @@ using System.Management;
 using System.Threading;
 using System.Threading.Tasks;
 
+namespace ProcessMonitorService;
+
 // Configuration Models
 public class ProcessMonitorOptions
 {
